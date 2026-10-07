@@ -41,7 +41,7 @@ through the gateway.
 
 ```hcl
 module "mimir" {
-  source = "git::https://github.com/HobOps/terraform-kubernetes-mimir.git?ref=v0.1.0"
+  source = "git::https://github.com/HobOps/terraform-kubernetes-mimir.git?ref=v0.0.1"
 
   tenants = {
     acme   = {}
