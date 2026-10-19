@@ -26,6 +26,7 @@ touches a cluster stack.
 | Config | Rendered into a Secret (it holds the S3 credentials) |
 | Auth | nginx gateway with basic auth; one random password per tenant |
 | Tenant binding | `X-Scope-OrgID` **must equal the authenticated user**, or the gateway answers 403 |
+| Per-tenant hostnames | Optional: `<prefix>-<tenant>-<random suffix>.<domain>` per tenant; a tenant's credentials only work on its own hostname |
 | Limits | Per-tenant overrides (retention, ingestion rate/burst, max series) in the runtime config |
 
 ### Why the tenant binding
@@ -37,11 +38,26 @@ requests whose header differs from the basic-auth user. `/` and `/ready` stay
 open for health checks. Tenant federation (`a|b`) is therefore not possible
 through the gateway.
 
+### Per-tenant hostnames
+
+With `httproute.tenant_hostnames`, every tenant gets its own public hostname,
+`<prefix>-<tenant>-<random suffix>.<domain>` (suffix: lowercase letters and
+digits, `suffix_length` long), all on the same HTTPRoute. The gateway maps the
+`Host` to a tenant and requires it to match the authenticated user too, so a
+tenant's credentials are useless on another tenant's hostname and on the shared
+hostname (which then only answers `/` and `/ready`). The in-cluster service
+names (`<release>-gateway.<namespace>.svc...`) keep serving every tenant, for
+Grafana and Prometheus inside the cluster.
+
+The `domain` must be covered by the listener's certificate. A wildcard
+certificate (`*.<domain>`) keeps the tenant hostnames out of Certificate
+Transparency logs; external-dns still publishes one record per hostname.
+
 ## Usage
 
 ```hcl
 module "mimir" {
-  source = "git::https://github.com/HobOps/terraform-kubernetes-mimir.git?ref=v0.0.1"
+  source = "git::https://github.com/HobOps/terraform-kubernetes-mimir.git?ref=v0.1.0"
 
   tenants = {
     acme   = {}
@@ -63,13 +79,17 @@ module "mimir" {
     hostname          = "mimir.example.com"
     gateway_name      = "public-gateway"
     gateway_namespace = "infrastructure"
+    # Optional: one hostname per tenant under a wildcard certificate.
+    tenant_hostnames = { domain = "example.com" }
   }
 }
 ```
 
 A client pushes with basic auth `acme:<password>` and the header
-`X-Scope-OrgID: acme` to `https://mimir.example.com/api/v1/push`; Grafana
-queries `https://mimir.example.com/prometheus` the same way.
+`X-Scope-OrgID: acme` to `https://mimir-acme-<suffix>.example.com/api/v1/push`
+(`https://mimir.example.com/api/v1/push` without `tenant_hostnames`); Grafana
+queries `<same base>/prometheus` the same way. OTLP metrics go to
+`<same base>/otlp/v1/metrics`. The exact URLs are in the `tenants` output.
 
 See [`examples/complete`](examples/complete).
 
@@ -86,7 +106,7 @@ See [`examples/complete`](examples/complete).
 | `ingester_replicas` | Ingesters (multiple of 3) | `3` |
 | `storage_class` | StorageClass for volumes | cluster default |
 | `ingester_storage_size` | Volume per ingester | `10Gi` |
-| `httproute` | `hostname`, `gateway_name`, `gateway_namespace`, `section_name` | `null` |
+| `httproute` | `hostname`, `gateway_name`, `gateway_namespace`, `section_name`, optional `tenant_hostnames` (`domain`, `prefix` = `mimir`, `suffix_length` = 8) | `null` |
 | `values` | Extra chart values, merged after the module's | `{}` |
 
 ## Outputs
@@ -95,13 +115,18 @@ See [`examples/complete`](examples/complete).
 |---|---|
 | `namespace` | Namespace |
 | `internal_url` | In-cluster gateway URL |
-| `external_url` | Public URL (with `httproute`) |
-| `tenants` | Sensitive: per tenant `username`, `password`, `push_url`, `query_url`, `push_url_internal`, `query_url_internal` |
+| `external_url` | Shared public URL (with `httproute`); health paths only when `tenant_hostnames` is set |
+| `tenants` | Sensitive: per tenant `username`, `password`, `hostname`, `push_url`, `query_url`, `otlp_url`, `push_url_internal`, `query_url_internal` |
 
 ## Notes
 
 - Tenant IDs: lowercase letters, digits, `-` and `_`.
 - Removing a tenant removes its password (it can no longer push or query); its
   blocks stay in the bucket until retention or manual cleanup.
+- Rotating a tenant's password:
+  `terraform apply -replace='module.<name>.random_password.tenant["<tenant>"]'`.
+  Rotating its hostname suffix:
+  `terraform apply -replace='module.<name>.random_string.tenant_suffix["<tenant>"]'`.
+  Then hand the client the new values from the `tenants` output.
 - Upgrading the chart: re-check the gateway nginx template still defines
   `httpSnippet`/`serverSnippet` and the classic-architecture keys.

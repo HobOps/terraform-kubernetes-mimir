@@ -21,6 +21,9 @@ module "mimir" {
     hostname          = "mimir.example.com"
     gateway_name      = "public-gateway"
     gateway_namespace = "infrastructure"
+    # acme -> mimir-acme-<8 random chars>.example.com; the listener must
+    # terminate TLS with a certificate for *.example.com.
+    tenant_hostnames = { domain = "example.com" }
   }
 }
 

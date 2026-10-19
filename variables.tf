@@ -89,12 +89,24 @@ variable "httproute" {
   description = <<-EOT
     Optional Gateway API HTTPRoute to the Mimir gateway (push and query for
     remote clients). null = no route.
+
+    `hostname` is the shared public hostname. With `tenant_hostnames` set, every
+    tenant also gets its own hostname `<prefix>-<tenant>-<random suffix>.<domain>`
+    and the gateway accepts a tenant's credentials only on that hostname (or on
+    the in-cluster service names); the shared hostname then answers only the
+    health paths. `domain` must be covered by the listener's certificate: a
+    wildcard keeps the tenant names out of Certificate Transparency.
   EOT
   type = object({
     hostname          = string
     gateway_name      = string
     gateway_namespace = string
     section_name      = optional(string, "https")
+    tenant_hostnames = optional(object({
+      domain        = string
+      prefix        = optional(string, "mimir")
+      suffix_length = optional(number, 8)
+    }))
   })
   default = null
 }
