@@ -3,6 +3,34 @@ locals {
   internal_url    = "http://${local.gateway_service}.${var.namespace}.svc.cluster.local"
   external_url    = var.httproute != null ? "https://${var.httproute.hostname}" : null
 
+  # Per-tenant public hostnames: <prefix>-<tenant>-<random suffix>.<domain>.
+  # "_" is valid in a tenant ID but not in a hostname.
+  per_tenant_hostnames = var.httproute != null && try(var.httproute.tenant_hostnames, null) != null
+  tenant_hostname = local.per_tenant_hostnames ? {
+    for t in keys(var.tenants) :
+    t => "${var.httproute.tenant_hostnames.prefix}-${replace(t, "_", "-")}-${random_string.tenant_suffix[t].result}.${var.httproute.tenant_hostnames.domain}"
+  } : {}
+  tenant_external_url = {
+    for t in keys(var.tenants) : t => local.per_tenant_hostnames ? "https://${local.tenant_hostname[t]}" : local.external_url
+  }
+
+  # Hostnames the gateway serves for any authenticated tenant: the in-cluster
+  # service names (Grafana, Prometheus) and local port-forwards. They are not
+  # reachable through the public Gateway, whose routes only carry the public
+  # hostnames.
+  internal_hostnames = [
+    local.gateway_service,
+    "${local.gateway_service}.${var.namespace}",
+    "${local.gateway_service}.${var.namespace}.svc",
+    "${local.gateway_service}.${var.namespace}.svc.cluster.local",
+    "localhost",
+    "127.0.0.1",
+  ]
+  nginx_host_map = join("\n", concat(
+    [for h in local.internal_hostnames : "  ${h} \"*\";"],
+    [for t in sort(keys(local.tenant_hostname)) : "  ${local.tenant_hostname[t]} \"${t}\";"],
+  ))
+
   # Per-tenant limits for Mimir's runtime config. Each tenant gets every limit
   # explicitly, so changing default_limits applies to all of them.
   tenant_overrides = {
@@ -24,7 +52,33 @@ locals {
   # authenticated user. "/" and "/ready" stay open for health checks. The
   # check runs in the rewrite phase, before auth_basic: a right header with a
   # wrong password still gets 401 afterwards.
-  nginx_http_snippet = <<-EOT
+  #
+  # With per-tenant hostnames the Host must also belong to that tenant
+  # ($tenant_host = tenant), or be an in-cluster name ($tenant_host = "*").
+  # Any other Host, the shared public hostname included, only serves the
+  # health paths.
+  nginx_http_snippet = local.per_tenant_hostnames ? local.nginx_http_snippet_per_tenant : local.nginx_http_snippet_shared
+
+  nginx_http_snippet_per_tenant = <<-EOT
+    map $uri $tenant_check_public {
+      "/"      1;
+      "/ready" 1;
+      default  0;
+    }
+    map $host $tenant_host {
+      hostnames;
+      default "";
+    ${local.nginx_host_map}
+    }
+    map "$tenant_check_public:$tenant_host:$remote_user:$http_x_scope_orgid" $tenant_check_ok {
+      "~^1:"                      1;
+      "~^0:\*:([^:|]+):\1$"       1;
+      "~^0:([^:|*]+):\1:\1$"      1;
+      default                     0;
+    }
+  EOT
+
+  nginx_http_snippet_shared = <<-EOT
     map $uri $tenant_check_public {
       "/"      1;
       "/ready" 1;
@@ -39,7 +93,7 @@ locals {
 
   nginx_server_snippet = <<-EOT
     if ($tenant_check_ok = 0) {
-      return 403 "X-Scope-OrgID must equal the authenticated user\n";
+      return 403 "use your tenant's hostname with its basic auth and X-Scope-OrgID equal to the user\n";
     }
   EOT
 
@@ -162,6 +216,18 @@ resource "random_password" "tenant" {
   special = false
 }
 
+# Random part of each tenant's public hostname. Rotate it with
+# terraform apply -replace='module.<name>.random_string.tenant_suffix["<tenant>"]'.
+resource "random_string" "tenant_suffix" {
+  for_each = local.per_tenant_hostnames ? var.tenants : {}
+
+  length  = var.httproute.tenant_hostnames.suffix_length
+  lower   = true
+  upper   = false
+  numeric = true
+  special = false
+}
+
 resource "kubernetes_secret" "htpasswd" {
   metadata {
     name      = "${var.release_name}-gateway-htpasswd"
@@ -203,7 +269,7 @@ resource "kubectl_manifest" "httproute" {
         namespace   = var.httproute.gateway_namespace
         sectionName = var.httproute.section_name
       }]
-      hostnames = [var.httproute.hostname]
+      hostnames = concat([var.httproute.hostname], [for t in sort(keys(local.tenant_hostname)) : local.tenant_hostname[t]])
       rules = [{
         matches     = [{ path = { type = "PathPrefix", value = "/" } }]
         backendRefs = [{ name = local.gateway_service, port = 80 }]
